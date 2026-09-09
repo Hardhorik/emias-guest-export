@@ -11,6 +11,7 @@ const { values: args, positionals } = parseArgs({ allowPositionals: true, option
   code: { type: 'string' }, out: { type: 'string', default: 'exports' },
   resume: { type: 'string' }, headed: { type: 'boolean', default: false },
   'uploads-only': { type: 'boolean', default: false },
+  'health-only': { type: 'boolean', default: false },
   'allow-third-party': { type: 'boolean', default: false },
   browser: { type: 'string' }, timeout: { type: 'string', default: '45000' },
   help: { type: 'boolean', short: 'h' },
@@ -24,6 +25,7 @@ if (args.help) {
   --browser NAME  Использовать установленный chrome или msedge
   --timeout MS    Таймаут операции, по умолчанию 45000 мс
   --uploads-only  Повторно обработать загруженные документы (с --resume)
+  --health-only   Обработать только информацию о здоровье и рецепты
   --allow-third-party  Не блокировать сторонние сетевые запросы страницы
 Переменные окружения: EMIAS_GUEST_URL и EMIAS_ACCESS_CODE.
 Код завершения: 0 — успешно, 2 — есть пропуски, 1 — ошибка входа/запуска.`);
@@ -32,6 +34,7 @@ if (args.help) {
 
 const timeout = Number(args.timeout);
 if (args['uploads-only'] && !args.resume) throw new Error('--uploads-only применяется вместе с --resume');
+if (args['uploads-only'] && args['health-only']) throw new Error('--uploads-only и --health-only несовместимы');
 if (!Number.isFinite(timeout) || timeout < 1000) throw new Error('--timeout должен быть числом >= 1000');
 const rl = createInterface({ input: stdin, output: stdout });
 let link, code;
@@ -54,8 +57,10 @@ let report = { version: 1, created: new Date().toISOString(), sourceHash, docume
 if (args.resume) {
   report = JSON.parse(await readFile(manifestFile, 'utf8'));
   if (report.sourceHash !== sourceHash) throw new Error('Эта папка относится к другой ссылке доступа');
-  report.sections = args['uploads-only'] ? report.sections.filter(s => s.category !== 'Загруженные документы') : [];
-  if (!args['uploads-only']) report.warnings = [];
+  if (args['uploads-only']) report.sections = report.sections.filter(s => s.category !== 'Загруженные документы');
+  else if (args['health-only']) report.sections = report.sections.filter(s => !['Информация о здоровье', 'Рецепты'].includes(s.category));
+  else report.sections = [];
+  if (!args['uploads-only'] && !args['health-only']) report.warnings = [];
 }
 async function checkpoint() {
   report.updated = new Date().toISOString();
@@ -248,12 +253,52 @@ try {
     }
   }
 
+  async function saveGenerated(category, key, title, extension, data, format, date = new Date().toISOString().slice(0, 10)) {
+    const item = { key: `generated_${key}`, title, date };
+    const relative = documentPath(category, item, `${title}.${extension}`);
+    const destination = path.join(directory, relative);
+    const previous = report.documents.find(document => document.key === item.key);
+    if (previous?.status === 'saved') {
+      try { await verifyFile(path.join(directory, previous.file), previous.sha256); return previous; }
+      catch { /* Recreate a missing or damaged export. */ }
+    }
+    await mkdir(path.dirname(destination), { recursive: true });
+    await writeFile(destination, data);
+    const verified = await verifyFile(destination);
+    const record = { ...item, category, ...verified, status: 'saved', file: relative, format };
+    if (previous) Object.assign(previous, record); else report.documents.push(record);
+    console.log(`  ✓ ${relative}`);
+    await checkpoint();
+    return record;
+  }
+
+  async function saveRecipe(item) {
+    const title = item.text.split(/\r?\n/).map(line => line.trim()).find(Boolean) || 'Рецепт';
+    const detailsResponse = page.waitForResponse(response =>
+      new URL(response.url()).pathname === '/api/3/receipt/details' && response.status() === 200);
+    await page.getByTestId(item.view).click();
+    const details = await (await detailsResponse).json();
+    const modal = page.getByTestId('modal_document_detail').or(page.getByRole('dialog')).first();
+    await modal.waitFor(); await settle();
+    const content = await modal.innerText();
+    await saveGenerated('Рецепты', `recipe_${item.key}_data`, `${title} — данные рецепта`, 'json',
+      Buffer.from(JSON.stringify(details, null, 2)), 'emias-json', item.date);
+    const escape = value => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const printable = await context.newPage();
+    try {
+      await printable.setContent(`<!doctype html><html lang="ru"><meta charset="utf-8"><title>${escape(title)}</title><style>@page{size:A4;margin:18mm}body{font:15px/1.5 Arial,sans-serif;color:#222}h1{font-size:22px}pre{font:inherit;white-space:pre-wrap}</style><h1>${escape(title)}</h1><pre>${escape(content)}</pre></html>`);
+      await saveGenerated('Рецепты', `recipe_${item.key}_view`, `${title} — рецепт`, 'pdf',
+        await printable.pdf({ format: 'A4', printBackground: true }), 'generated-pdf', item.date);
+    } finally { await printable.close(); }
+    await closeDocument();
+  }
+
   const categories = [
     ['analyzes', 'Анализы'], ['inspections', 'Приёмы'], ['research', 'Исследования'],
     ['medical-certificates', 'Справки'], ['disability_forms', 'Больничные'],
     ['epicrisis', 'Выписки'], ['ambulance', 'Скорая помощь'], ['consilium', 'Консилиумы'],
   ];
-  for (const [id, category] of (args['uploads-only'] ? [] : categories)) {
+  for (const [id, category] of (args['uploads-only'] || args['health-only'] ? [] : categories)) {
     const section = { category, status: 'pending', expected: null, found: 0 };
     report.sections.push(section);
     try {
@@ -328,6 +373,85 @@ try {
     } finally { await checkpoint(); }
   }
 
+  if (!args['uploads-only']) {
+    const section = { category: 'Информация о здоровье', status: 'pending', found: 0 };
+    report.sections.push(section);
+    try {
+      await page.goto('https://lk.emias.mos.ru/medical-records'); await settle();
+      const summaryResponse = page.waitForResponse(response =>
+        new URL(response.url()).pathname === '/api/1/health/summary' && response.status() === 200);
+      await page.getByTestId('content_links_health_information_button').click();
+      const summary = await (await summaryResponse).json();
+      await settle();
+      await saveGenerated(section.category, 'health_summary_data', 'Информация о здоровье — данные', 'json',
+        Buffer.from(JSON.stringify(summary, null, 2)), 'emias-json');
+      await saveGenerated(section.category, 'health_summary_view', 'Информация о здоровье — страница', 'pdf',
+        await page.pdf({ format: 'A4', printBackground: true }), 'page-pdf');
+      section.found = 2;
+      section.status = 'complete';
+    } catch (error) {
+      section.status = 'failed'; section.error = errorText(error);
+      warning(`${section.category}: ${section.error}`);
+    } finally { await checkpoint(); }
+
+    const recipes = { category: 'Рецепты', status: 'pending', expected: null, found: 0 };
+    report.sections.push(recipes);
+    try {
+      await page.goto('https://lk.emias.mos.ru/medical-records'); await settle();
+      const card = page.getByTestId('recipes_container');
+      await card.waitFor();
+      const counter = page.getByTestId('recipes_count_value');
+      recipes.expected = Number(await counter.innerText());
+      console.log(`Рецепты: ${recipes.expected} документов`);
+      await page.getByTestId('recipes_open_button').click(); await settle();
+      const recipeList = card.getByRole('button', { name: 'Рецепты', exact: true });
+      await recipeList.waitFor();
+      await recipeList.click(); await settle();
+      const all = page.getByTestId('recipes_list_all');
+      await all.waitFor();
+      if (await all.isEnabled()) await all.evaluate(element => element.click());
+      await settle();
+      if (recipes.expected > 0) {
+        await card.locator('[data-testid^="item_recipe_"][data-testid$="_view"]').first().waitFor();
+      }
+      const items = new Map();
+      for (let pass = 0; pass < 100; pass++) {
+        for (const item of await collect(card)) {
+          items.set(item.key, item);
+          try { await saveRecipe(item); }
+          catch (error) {
+            await closeDocument().catch(() => {});
+            const key = `generated_recipe_${item.key}_data`;
+            const record = report.documents.find(document => document.key === key)
+              || { key, category: recipes.category, date: item.date, title: item.text.split(/\r?\n/)[0], status: 'failed' };
+            record.status = 'failed'; record.error = errorText(error);
+            if (!report.documents.includes(record)) report.documents.push(record);
+            warning(`Рецепты: ${item.key}: ${record.error}`);
+            await checkpoint();
+          }
+        }
+        const next = card.getByRole('button', { name: String(pass + 2), exact: true });
+        if (await next.count() && await next.isVisible() && await next.isEnabled()) {
+          await next.click(); await settle(); continue;
+        }
+        const more = card.getByRole('button', { name: /^(показать (еще|ещё)|загрузить (еще|ещё))/i });
+        if (!await more.count() || !await more.first().isVisible()) break;
+        const before = items.size;
+        await more.first().click(); await settle();
+        if ((await collect(card)).length === before) break;
+      }
+      recipes.found = items.size;
+      const unavailable = report.documents.filter(document => document.category === recipes.category && document.status !== 'saved').length;
+      recipes.unavailable = unavailable;
+      recipes.status = recipes.expected === 0 && items.size === 0 ? 'empty'
+        : recipes.expected === items.size && unavailable === 0 ? 'complete' : 'incomplete';
+      if (recipes.status === 'incomplete') warning(`Рецепты: сайт указал ${recipes.expected}, найдено ${items.size}.`);
+    } catch (error) {
+      recipes.status = 'failed'; recipes.error = errorText(error);
+      warning(`${recipes.category}: ${recipes.error}`);
+    } finally { await checkpoint(); }
+  }
+
   // Other sections vary across accounts. Export known document controls and flag any
   // unsupported content instead of claiming that an unrecognised list is empty.
   for (const [testId, category, emptyPattern] of [
@@ -335,7 +459,7 @@ try {
     ['diaries_card_open_button', 'Дневник здоровья', /Нет данных|нет записей/i],
     ['checkups_block_open_button', 'Диспансеризация', /Нет данных|не проходили/i],
     ['content_links_docs_button', 'Загруженные документы', /Пока нет загруженных документов/],
-  ].filter(([, category]) => !args['uploads-only'] || category === 'Загруженные документы')) {
+  ].filter(([, category]) => args['uploads-only'] ? category === 'Загруженные документы' : !args['health-only'])) {
     const section = { category, status: 'pending', found: 0 };
     report.sections.push(section);
     try {
