@@ -1,0 +1,26 @@
+{
+  "name": "emias-document-export",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Download documents available through an EMIAS guest link",
+  "license": "MIT",
+  "keywords": ["emias", "medical-records", "export", "playwright"],
+  "bin": { "emias-export": "./emias-export.mjs" },
+  "files": [
+    "emias-export.mjs",
+    "export-utils.mjs",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "download": "node emias-export.mjs",
+    "test": "node --test",
+    "check": "node --check emias-export.mjs && node --check export-utils.mjs && npm test"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "playwright": "^1.55.0"
+  }
+}

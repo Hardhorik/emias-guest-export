@@ -1,0 +1,50 @@
+name: Ошибка
+description: Сообщить об ошибке без публикации медицинских данных
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Не прикладывайте гостевую ссылку, код, архив, manifest.json, ФИО, номер полиса или медицинские документы. Замените реальные значения вымышленными.
+  - type: input
+    id: os
+    attributes:
+      label: Операционная система
+      placeholder: Windows 11, macOS 15, Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: node
+    attributes:
+      label: Версия Node.js
+      placeholder: v20.19.0
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Команда запуска без ссылки и кода
+      placeholder: npm run download -- --browser chrome
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Что произошло
+      description: Укажите код завершения и обезличенное сообщение об ошибке.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Ожидаемый результат
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Проверка приватности
+      options:
+        - label: Я удалил(а) из сообщения и вложений ссылки, коды и медицинские данные.
+          required: true

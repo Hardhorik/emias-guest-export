@@ -1,0 +1,9 @@
+node_modules/
+exports/
+output/
+.playwright-cli/
+*.partial
+.env
+.env.*
+!.env.example
+npm-debug.log*
