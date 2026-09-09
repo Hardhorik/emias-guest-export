@@ -11,6 +11,7 @@ const { values: args, positionals } = parseArgs({ allowPositionals: true, option
   code: { type: 'string' }, out: { type: 'string', default: 'exports' },
   resume: { type: 'string' }, headed: { type: 'boolean', default: false },
   'uploads-only': { type: 'boolean', default: false },
+  'extra-only': { type: 'boolean', default: false },
   'allow-third-party': { type: 'boolean', default: false },
   browser: { type: 'string' }, timeout: { type: 'string', default: '45000' },
   help: { type: 'boolean', short: 'h' },
@@ -24,6 +25,7 @@ if (args.help) {
   --browser NAME  Использовать установленный chrome или msedge
   --timeout MS    Таймаут операции, по умолчанию 45000 мс
   --uploads-only  Повторно обработать загруженные документы (с --resume)
+  --extra-only    Обработать только дневник здоровья и диспансеризацию
   --allow-third-party  Не блокировать сторонние сетевые запросы страницы
 Переменные окружения: EMIAS_GUEST_URL и EMIAS_ACCESS_CODE.
 Код завершения: 0 — успешно, 2 — есть пропуски, 1 — ошибка входа/запуска.`);
@@ -32,6 +34,7 @@ if (args.help) {
 
 const timeout = Number(args.timeout);
 if (args['uploads-only'] && !args.resume) throw new Error('--uploads-only применяется вместе с --resume');
+if (args['uploads-only'] && args['extra-only']) throw new Error('--uploads-only и --extra-only несовместимы');
 if (!Number.isFinite(timeout) || timeout < 1000) throw new Error('--timeout должен быть числом >= 1000');
 const rl = createInterface({ input: stdin, output: stdout });
 let link, code;
@@ -54,8 +57,10 @@ let report = { version: 1, created: new Date().toISOString(), sourceHash, docume
 if (args.resume) {
   report = JSON.parse(await readFile(manifestFile, 'utf8'));
   if (report.sourceHash !== sourceHash) throw new Error('Эта папка относится к другой ссылке доступа');
-  report.sections = args['uploads-only'] ? report.sections.filter(s => s.category !== 'Загруженные документы') : [];
-  if (!args['uploads-only']) report.warnings = [];
+  if (args['uploads-only']) report.sections = report.sections.filter(s => s.category !== 'Загруженные документы');
+  else if (args['extra-only']) report.sections = report.sections.filter(s => !['Дневник здоровья', 'Диспансеризация'].includes(s.category));
+  else report.sections = [];
+  if (!args['uploads-only'] && !args['extra-only']) report.warnings = [];
 }
 async function checkpoint() {
   report.updated = new Date().toISOString();
@@ -90,6 +95,13 @@ try {
   }
   const page = await context.newPage();
   page.setDefaultTimeout(timeout);
+  let apiAuthHeaders = {};
+  page.on('request', request => {
+    const headers = request.headers();
+    const auth = Object.fromEntries(Object.entries(headers)
+      .filter(([name]) => ['x-access-jwt', 'x-system-name'].includes(name.toLowerCase())));
+    if (auth['x-access-jwt']) apiAuthHeaders = auth;
+  });
   const settle = async () => {
     // React schedules some requests after the click handler returns.
     await page.waitForTimeout(350);
@@ -248,12 +260,124 @@ try {
     }
   }
 
+  async function saveGenerated(category, key, title, extension, data, format) {
+    const date = new Date().toISOString().slice(0, 10);
+    const item = { key: `generated_${key}`, title, date };
+    const relative = documentPath(category, item, `${title}.${extension}`);
+    const destination = path.join(directory, relative);
+    const previous = report.documents.find(document => document.key === item.key);
+    if (previous?.status === 'saved') {
+      try { await verifyFile(path.join(directory, previous.file), previous.sha256); return previous; }
+      catch { /* Recreate a missing or damaged snapshot. */ }
+    }
+    await mkdir(path.dirname(destination), { recursive: true });
+    await writeFile(destination, data);
+    const verified = await verifyFile(destination);
+    const record = { ...item, category, ...verified, status: 'saved', file: relative, format };
+    if (previous) Object.assign(previous, record); else report.documents.push(record);
+    console.log(`  ✓ ${relative}`);
+    await checkpoint();
+    return record;
+  }
+
+  async function captureJson(action, predicate) {
+    const requests = [];
+    const listener = response => {
+      if (!predicate(response)) return;
+      const request = response.request();
+      const headers = request.headers();
+      requests.push({
+        url: response.url(), method: request.method(), postData: request.postData(),
+        headers: Object.fromEntries(Object.entries(headers)
+          .filter(([name]) => ['accept', 'authorization', 'content-type', 'x-access-jwt', 'x-system-name'].includes(name.toLowerCase()))),
+      });
+    };
+    page.on('response', listener);
+    try { await action(); await settle(); }
+    finally { page.off('response', listener); }
+    const captured = [];
+    for (const request of requests.filter((item, index, all) =>
+      all.findIndex(other => other.url === item.url && other.method === item.method && other.postData === item.postData) === index)) {
+      try {
+        const result = await page.evaluate(async request => {
+          const response = await fetch(request.url, {
+            method: request.method, credentials: 'same-origin', headers: { ...apiAuthHeaders, ...request.headers },
+            ...(request.postData ? { body: request.postData } : {}),
+          });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return response.json();
+        }, request);
+        captured.push({ endpoint: new URL(request.url).pathname, request: request.postData ? JSON.parse(request.postData) : null, response: result });
+      } catch { /* A failed replay is represented by the rendered PDF. */ }
+    }
+    return captured;
+  }
+
+  async function exportDiary(section) {
+    await page.getByTestId('bloodPressure_tab_button').waitFor();
+    const tabs = await page.locator('[data-testid$="_tab_button"]').evaluateAll(nodes => nodes
+      .filter(node => node.getClientRects().length)
+      .map(node => ({ id: node.dataset.testid, title: node.innerText.trim() })));
+    for (const tab of tabs) {
+      const indicator = tab.id.replace(/_tab_button$/, '');
+      const captured = await captureJson(
+        () => page.getByTestId(tab.id).click(),
+        response => new URL(response.url()).pathname === '/api/1/diaries/get-list' && response.status() === 200,
+      );
+      const first = captured[0];
+      const pageTotal = Number(first?.response?.pageTotal || 1);
+      if (first?.request && pageTotal > 1) {
+        for (let pageNumber = 1; pageNumber < pageTotal; pageNumber++) {
+          const response = await page.evaluate(async ({ body }) => {
+            const result = await fetch('/api/1/diaries/get-list', {
+              method: 'POST', credentials: 'same-origin',
+              headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+            });
+            if (!result.ok) throw new Error(`HTTP ${result.status}`);
+            return result.json();
+          }, { body: { ...first.request, pageNumber } });
+          captured.push({ endpoint: '/api/1/diaries/get-list', request: { ...first.request, pageNumber }, response });
+        }
+      }
+      await saveGenerated('Дневник здоровья', `diary_${indicator}_data`, `${tab.title} — данные`, 'json',
+        Buffer.from(JSON.stringify(captured, null, 2)), 'emias-json');
+      await saveGenerated('Дневник здоровья', `diary_${indicator}_view`, `${tab.title} — страница`, 'pdf',
+        await page.pdf({ format: 'A4', printBackground: true }), 'page-pdf');
+    }
+    section.found = tabs.length * 2;
+    section.status = tabs.length && report.documents
+      .filter(document => document.category === 'Дневник здоровья')
+      .every(document => document.status === 'saved') ? 'complete' : 'incomplete';
+  }
+
+  async function exportCheckup(section, initialResponses) {
+    await page.locator('[data-testid$="_tab_button"]').first().waitFor();
+    if (!initialResponses.length) {
+      initialResponses = await page.evaluate(async authHeaders => {
+        const result = [];
+        const urls = [...new Set(performance.getEntriesByType('resource').map(entry => entry.name)
+          .filter(url => /^https:\/\/lk\.emias\.mos\.ru\/api\/(?:1\/checkup|2\/form\/checkup)/.test(url)))];
+        for (const url of urls) {
+          const response = await fetch(url, { credentials: 'same-origin', headers: authHeaders });
+          if (response.ok) result.push({ endpoint: new URL(url).pathname, request: null, response: await response.json() });
+        }
+        return result;
+      }, apiAuthHeaders);
+    }
+    await saveGenerated('Диспансеризация', 'checkup_data', 'Диспансеризация — данные', 'json',
+      Buffer.from(JSON.stringify(initialResponses, null, 2)), 'emias-json');
+    await saveGenerated('Диспансеризация', 'checkup_view', 'Диспансеризация — страница', 'pdf',
+      await page.pdf({ format: 'A4', printBackground: true }), 'page-pdf');
+    section.found = 2;
+    section.status = initialResponses.length ? 'complete' : 'incomplete';
+  }
+
   const categories = [
     ['analyzes', 'Анализы'], ['inspections', 'Приёмы'], ['research', 'Исследования'],
     ['medical-certificates', 'Справки'], ['disability_forms', 'Больничные'],
     ['epicrisis', 'Выписки'], ['ambulance', 'Скорая помощь'], ['consilium', 'Консилиумы'],
   ];
-  for (const [id, category] of (args['uploads-only'] ? [] : categories)) {
+  for (const [id, category] of (args['uploads-only'] || args['extra-only'] ? [] : categories)) {
     const section = { category, status: 'pending', expected: null, found: 0 };
     report.sections.push(section);
     try {
@@ -335,14 +459,30 @@ try {
     ['diaries_card_open_button', 'Дневник здоровья', /Нет данных|нет записей/i],
     ['checkups_block_open_button', 'Диспансеризация', /Нет данных|не проходили/i],
     ['content_links_docs_button', 'Загруженные документы', /Пока нет загруженных документов/],
-  ].filter(([, category]) => !args['uploads-only'] || category === 'Загруженные документы')) {
+  ].filter(([, category]) => args['uploads-only'] ? category === 'Загруженные документы'
+    : args['extra-only'] ? ['Дневник здоровья', 'Диспансеризация'].includes(category) : true)) {
     const section = { category, status: 'pending', found: 0 };
     report.sections.push(section);
     try {
       await page.goto('https://lk.emias.mos.ru/medical-records'); await settle();
       const open = page.getByTestId(testId);
       await open.waitFor();
-      await open.click(); await settle();
+      const sectionResponses = category === 'Диспансеризация'
+        ? await captureJson(
+          () => open.click(),
+          response => /^\/api\/(?:1\/checkup|2\/form\/checkup)/.test(new URL(response.url()).pathname) && response.status() === 200,
+        )
+        : (await open.click(), await settle(), []);
+      if (category === 'Дневник здоровья') {
+        await exportDiary(section);
+        await checkpoint();
+        continue;
+      }
+      if (category === 'Диспансеризация') {
+        await exportCheckup(section, sectionResponses);
+        await checkpoint();
+        continue;
+      }
       if (category === 'Загруженные документы' && await page.locator('[data-testid^="document_modal_open-"]').count()) {
         let recordCount = 0;
         await settle();
