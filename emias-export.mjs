@@ -274,22 +274,38 @@ try {
 
   async function saveRecipe(item) {
     const title = item.text.split(/\r?\n/).map(line => line.trim()).find(Boolean) || 'Рецепт';
+    const pdfKey = `recipe_pdf_${item.key}`;
+    const previousPdf = report.documents.find(document => document.key === pdfKey);
+    if (previousPdf?.status === 'saved') {
+      try { await verifyFile(path.join(directory, previousPdf.file), previousPdf.sha256); return; }
+      catch { /* Re-download a missing or damaged original PDF. */ }
+    }
     const detailsResponse = page.waitForResponse(response =>
       new URL(response.url()).pathname === '/api/3/receipt/details' && response.status() === 200);
     await page.getByTestId(item.view).click();
     const details = await (await detailsResponse).json();
     const modal = page.getByTestId('modal_document_detail').or(page.getByRole('dialog')).first();
     await modal.waitFor(); await settle();
-    const content = await modal.innerText();
     await saveGenerated('Рецепты', `recipe_${item.key}_data`, `${title} — данные рецепта`, 'json',
       Buffer.from(JSON.stringify(details, null, 2)), 'emias-json', item.date);
-    const escape = value => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const printable = await context.newPage();
-    try {
-      await printable.setContent(`<!doctype html><html lang="ru"><meta charset="utf-8"><title>${escape(title)}</title><style>@page{size:A4;margin:18mm}body{font:15px/1.5 Arial,sans-serif;color:#222}h1{font-size:22px}pre{font:inherit;white-space:pre-wrap}</style><h1>${escape(title)}</h1><pre>${escape(content)}</pre></html>`);
-      await saveGenerated('Рецепты', `recipe_${item.key}_view`, `${title} — рецепт`, 'pdf',
-        await printable.pdf({ format: 'A4', printBackground: true }), 'generated-pdf', item.date);
-    } finally { await printable.close(); }
+    const pending = page.waitForEvent('download', { timeout });
+    await modal.locator('button').last().click();
+    const download = await pending;
+    const failure = await download.failure();
+    if (failure) throw new Error(failure);
+    const pdfItem = { ...item, key: pdfKey, title };
+    const relative = documentPath('Рецепты', pdfItem, download.suggestedFilename());
+    const destination = path.join(directory, relative);
+    await mkdir(path.dirname(destination), { recursive: true });
+    await download.saveAs(destination);
+    let verified;
+    try { verified = await verifyFile(destination); }
+    catch (error) { await unlink(destination).catch(() => {}); throw error; }
+    const record = { key: pdfKey, category: 'Рецепты', date: item.date, title, ...verified,
+      status: 'saved', file: relative, format: 'original-pdf', suggestedFilename: download.suggestedFilename() };
+    if (previousPdf) Object.assign(previousPdf, record); else report.documents.push(record);
+    console.log(`  ✓ ${relative}`);
+    await checkpoint();
     await closeDocument();
   }
 
@@ -421,7 +437,7 @@ try {
           try { await saveRecipe(item); }
           catch (error) {
             await closeDocument().catch(() => {});
-            const key = `generated_recipe_${item.key}_data`;
+            const key = `recipe_pdf_${item.key}`;
             const record = report.documents.find(document => document.key === key)
               || { key, category: recipes.category, date: item.date, title: item.text.split(/\r?\n/)[0], status: 'failed' };
             record.status = 'failed'; record.error = errorText(error);
