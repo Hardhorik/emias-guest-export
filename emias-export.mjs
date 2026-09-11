@@ -5,7 +5,7 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
-import { doctorDetails, documentDate, documentPath, healthSummaryHtml, isAllowedBrowserRequest, isAllowedEmiasGuestUrl, sha256, verifyFile, zipDirectory } from './export-utils.mjs';
+import { ambulanceDetails, doctorDetails, documentDate, documentPath, healthSummaryHtml, isAllowedBrowserRequest, isAllowedEmiasGuestUrl, sha256, verifyFile, zipDirectory } from './export-utils.mjs';
 
 const { values: args, positionals } = parseArgs({ allowPositionals: true, options: {
   code: { type: 'string' }, out: { type: 'string', default: 'exports' },
@@ -144,7 +144,7 @@ try {
       }
       return [...result.values()];
     });
-    return entries.map(item => ({ ...item, date: documentDate(item.text), ...doctorDetails(item) }));
+    return entries.map(item => ({ ...item, date: documentDate(item.text), ...doctorDetails(item), ...ambulanceDetails(item) }));
   }
 
   async function saveDocument(category, item) {
@@ -152,20 +152,24 @@ try {
     if (previous?.status === 'saved') {
       try {
         await verifyFile(path.join(directory, previous.file), previous.sha256);
-        if (item.doctor && item.specialty) {
-          const nextFile = documentPath(category, item, previous.suggestedFilename || path.basename(previous.file));
-          if (nextFile !== previous.file) {
-            await mkdir(path.dirname(path.join(directory, nextFile)), { recursive: true });
-            await rename(path.join(directory, previous.file), path.join(directory, nextFile));
-          }
-          Object.assign(previous, { file: nextFile, doctor: item.doctor, specialty: item.specialty });
+        const nextFile = documentPath(category, item, previous.suggestedFilename || path.basename(previous.file));
+        if (nextFile !== previous.file) {
+          await mkdir(path.dirname(path.join(directory, nextFile)), { recursive: true });
+          await rename(path.join(directory, previous.file), path.join(directory, nextFile));
+        }
+        const metadataChanged = nextFile !== previous.file || item.title !== previous.title ||
+          item.diagnosis !== previous.diagnosis || item.doctor !== previous.doctor || item.specialty !== previous.specialty;
+        if (metadataChanged) {
+          Object.assign(previous, { file: nextFile, title: item.title, diagnosis: item.diagnosis,
+            doctor: item.doctor, specialty: item.specialty });
           await checkpoint();
         }
         return;
       }
       catch { /* Re-download a missing or damaged file. */ }
     }
-    const entry = { key: item.key, category, date: item.date, title: item.title, doctor: item.doctor, specialty: item.specialty, description: item.text, status: 'pending' };
+    const entry = { key: item.key, category, date: item.date, title: item.title, diagnosis: item.diagnosis,
+      doctor: item.doctor, specialty: item.specialty, description: item.text, status: 'pending' };
     if (previous) Object.assign(previous, entry); else report.documents.push(entry);
     const record = previous || entry;
     for (let attempt = 1; attempt <= 2; attempt++) {

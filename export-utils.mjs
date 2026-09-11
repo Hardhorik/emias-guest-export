@@ -48,6 +48,16 @@ export function doctorDetails(item) {
   return { doctor, specialty: lines.slice(0, dateIndex - 1).join(' ') };
 }
 
+export function ambulanceDetails(item) {
+  if (!item.key?.startsWith('item_ambulance_')) return {};
+  const lines = String(item.text || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  const dateIndex = lines.findIndex(line => /^\d{2}\.\d{2}\.\d{4}$/.test(line));
+  if (dateIndex < 0) return {};
+  const diagnosis = lines.slice(dateIndex + 1)
+    .find(line => !/^\d{1,2}:\d{2}(?::\d{2})?$/.test(line));
+  return diagnosis ? { diagnosis, title: diagnosis } : {};
+}
+
 export function documentPath(category, item, suggestedName) {
   const ext = path.extname(suggestedName).toLowerCase();
   const extension = /^\.[a-z0-9]{1,8}$/.test(ext) ? ext : '.bin';

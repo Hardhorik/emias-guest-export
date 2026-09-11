@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { doctorDetails, documentDate, documentPath, healthSummaryHtml, isAllowedBrowserRequest, isAllowedEmiasGuestUrl, safeName, verifyFile, zipDirectory } from './export-utils.mjs';
+import { ambulanceDetails, doctorDetails, documentDate, documentPath, healthSummaryHtml, isAllowedBrowserRequest, isAllowedEmiasGuestUrl, safeName, verifyFile, zipDirectory } from './export-utils.mjs';
 
 test('accepts only the exact EMIAS guest origin and blocks third-party requests', () => {
   assert.equal(isAllowedEmiasGuestUrl('https://lk.emias.mos.ru/guest?token=fake'), true);
@@ -25,6 +25,16 @@ test('doctor and specialty come from the appointment row, not the clinic', () =>
   assert.deepEqual(doctorDetails({ ...item, key: 'item_analyze_test' }), {});
   assert.equal(doctorDetails({ ...item, text: 'Врач\nИванов Иван Иванович\n29.10.2024' }).doctor, 'Иванов Иван Иванович');
   assert.equal(doctorDetails({ ...item, text: 'Врач-хирург\nИВАНОВ И И\n29.10.2024' }).doctor, 'ИВАНОВ И И');
+});
+
+test('ambulance diagnosis becomes the visible document title', () => {
+  const item = { key: 'item_ambulance_test', text: '23.11.2021\n14:47\nОстрый панкреатит неуточненный' };
+  const details = ambulanceDetails(item);
+  assert.deepEqual(details, { diagnosis: 'Острый панкреатит неуточненный', title: 'Острый панкреатит неуточненный' });
+  const file = documentPath('Скорая помощь', { ...item, ...details, date: documentDate(item.text) }, 'Карта вызова скорой помощи.pdf');
+  assert.match(file, /2021-11-23__Острый панкреатит неуточненный__.+\.pdf$/);
+  assert.deepEqual(ambulanceDetails({ ...item, key: 'item_inspection_test' }), {});
+  assert.deepEqual(ambulanceDetails({ ...item, text: '23.11.2021\n14:47' }), {});
 });
 
 test('dates sort chronologically and invalid dates are not invented', () => {
