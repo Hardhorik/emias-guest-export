@@ -5,7 +5,7 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
-import { doctorDetails, documentDate, documentPath, isAllowedBrowserRequest, isAllowedEmiasGuestUrl, sha256, verifyFile, zipDirectory } from './export-utils.mjs';
+import { doctorDetails, documentDate, documentPath, healthSummaryHtml, isAllowedBrowserRequest, isAllowedEmiasGuestUrl, sha256, verifyFile, zipDirectory } from './export-utils.mjs';
 
 const { values: args, positionals } = parseArgs({ allowPositionals: true, options: {
   code: { type: 'string' }, out: { type: 'string', default: 'exports' },
@@ -280,10 +280,12 @@ try {
       try { await verifyFile(path.join(directory, previousPdf.file), previousPdf.sha256); return; }
       catch { /* Re-download a missing or damaged original PDF. */ }
     }
-    const detailsResponse = page.waitForResponse(response =>
-      new URL(response.url()).pathname === '/api/3/receipt/details' && response.status() === 200);
-    await page.getByTestId(item.view).click();
-    const details = await (await detailsResponse).json();
+    const [detailsResponse] = await Promise.all([
+      page.waitForResponse(response =>
+        new URL(response.url()).pathname === '/api/3/receipt/details' && response.status() === 200),
+      page.getByTestId(item.view).click(),
+    ]);
+    const details = await detailsResponse.json();
     const modal = page.getByTestId('modal_document_detail').or(page.getByRole('dialog')).first();
     await modal.waitFor(); await settle();
     await saveGenerated('Рецепты', `recipe_${item.key}_data`, `${title} — данные рецепта`, 'json',
@@ -401,8 +403,12 @@ try {
       await settle();
       await saveGenerated(section.category, 'health_summary_data', 'Информация о здоровье — данные', 'json',
         Buffer.from(JSON.stringify(summary, null, 2)), 'emias-json');
-      await saveGenerated(section.category, 'health_summary_view', 'Информация о здоровье — страница', 'pdf',
-        await page.pdf({ format: 'A4', printBackground: true }), 'page-pdf');
+      const printable = await context.newPage();
+      try {
+        await printable.setContent(healthSummaryHtml(summary));
+        await saveGenerated(section.category, 'health_summary_view', 'Информация о здоровье — сведения', 'pdf',
+          await printable.pdf({ format: 'A4', printBackground: true }), 'generated-text-pdf');
+      } finally { await printable.close(); }
       section.found = 2;
       section.status = 'complete';
     } catch (error) {

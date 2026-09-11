@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { doctorDetails, documentDate, documentPath, isAllowedBrowserRequest, isAllowedEmiasGuestUrl, safeName, verifyFile, zipDirectory } from './export-utils.mjs';
+import { doctorDetails, documentDate, documentPath, healthSummaryHtml, isAllowedBrowserRequest, isAllowedEmiasGuestUrl, safeName, verifyFile, zipDirectory } from './export-utils.mjs';
 
 test('accepts only the exact EMIAS guest origin and blocks third-party requests', () => {
   assert.equal(isAllowedEmiasGuestUrl('https://lk.emias.mos.ru/guest?token=fake'), true);
@@ -32,6 +32,20 @@ test('dates sort chronologically and invalid dates are not invented', () => {
   assert.equal(documentDate('31.02.2024'), null);
   assert.equal(documentDate('Нет даты'), null);
   assert.equal(documentDate('29.02.2024'), '2024-02-29');
+});
+
+test('renders health summary as readable escaped tables', () => {
+  const html = healthSummaryHtml({
+    bloodType: { result: 'A < II', identificationDate: '2025-04-03T00:00:00' },
+    rhFactor: { result: 'Положительный', identificationDate: '2025-04-03' },
+    dispensaryObservationDiagnoses: [{ code: 'J00', title: 'Тест', opened: '2024-01-02', doctor: {
+      lastName: 'Иванов', firstName: 'Иван', middleName: 'Иванович', specialityName: 'Терапевт',
+    } }],
+  });
+  assert.match(html, /A &lt; II/);
+  assert.match(html, /03\.04\.2025/);
+  assert.match(html, /Иванов Иван Иванович/);
+  assert.match(html, /Диспансерное наблюдение/);
 });
 test('Windows-safe paths preserve Cyrillic and distinguish duplicate titles', () => {
   const a = documentPath('Приёмы', { key: 'one', date: '2024-02-09' }, 'Осмотр: терапевта.pdf');
